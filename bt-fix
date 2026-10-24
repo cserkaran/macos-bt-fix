@@ -1,0 +1,190 @@
+#!/bin/zsh
+# bt-fix - keep Bluetooth input devices reconnecting across home/office switches.
+#
+#   bt-fix status   list paired devices and whether each is connected
+#   bt-fix cycle    power-cycle Bluetooth, wait, then log what reconnected
+#   bt-fix check    run `cycle` only if a paired mouse/keyboard type has nothing connected
+#   bt-fix watch    loop forever: `check` after login, after each wake, after Bluetooth power-on
+#   bt-fix init     write ~/.config/bt-fix/known from the current paired list (--force to overwrite)
+#   bt-fix install  write ~/Library/LaunchAgents/local.bt-fix.plist and start the watcher
+#
+# New Mac: brew install blueutil; copy this file to ~/.local/bin; pair devices; bt-fix init; bt-fix install
+#
+# Log file: ~/Library/Logs/bt-fix.log
+
+set -u
+SELF=${0:A}   # absolute path of this script; $0 inside functions is the function name
+for BLUEUTIL in /opt/homebrew/bin/blueutil /usr/local/bin/blueutil; do [[ -x "$BLUEUTIL" ]] && break; done
+[[ -x "$BLUEUTIL" ]] || { print -u2 "bt-fix: blueutil not found; run: brew install blueutil"; exit 69; }
+LOG=$HOME/Library/Logs/bt-fix.log
+SETTLE=20   # seconds to let macOS reconnect on its own before intervening
+POLL=10     # watch loop interval in seconds
+umask 077   # log files are owner-only; they contain device hardware addresses
+
+# Devices this script is allowed to reason about live in CONF, one address per
+# line (as shown by `bt-fix status`), '#' comments allowed. `bt-fix init` writes
+# it from the current paired list. Anything paired but not listed is reported.
+CONF=$HOME/.config/bt-fix/known
+KNOWN=()
+if [[ "${1:-status}" == (cycle|check|watch) ]]; then
+  [[ -r "$CONF" ]] || { print -u2 "bt-fix: $CONF missing; run: bt-fix init"; exit 78; }
+  KNOWN=(${(f)"$(sed -E 's/#.*//; s/[[:space:]]//g' "$CONF" | grep .)"})
+fi
+
+MAX_BYTES=$((512 * 1024))   # rotate the live log past this size
+KEEP_DAYS=3                 # delete rotated logs older than this
+
+# Roll the live log into bt-fix.log.YYYY-MM-DD when it is from a previous day or too big,
+# then prune rotated files older than KEEP_DAYS. Truncates in place so launchd keeps its handle.
+rotate() {
+  [[ -s "$LOG" ]] || return 0
+  local size first_day today
+  size=$(stat -f %z "$LOG")
+  first_day=$(head -c 10 "$LOG")
+  today=$(date +%F)
+  [[ "$first_day" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || first_day=$today
+  if (( size > MAX_BYTES )) || [[ "$first_day" != "$today" ]]; then
+    cat "$LOG" >> "$LOG.$first_day" && : > "$LOG"
+  fi
+  find "${LOG:h}" -name "${LOG:t}.*" -mtime +"$KEEP_DAYS" -delete
+}
+
+log() {
+  rotate
+  local line="$(date '+%F %T') $*"
+  print -r -- "$line" >> "$LOG"
+  [[ -t 2 ]] && print -r -- "$line" >&2
+  return 0
+}
+
+# One line per paired device: STATE|TYPE|ADDRESS|NAME  (STATE is on/off)
+devices() {
+  system_profiler SPBluetoothDataType -json 2>/dev/null | /usr/bin/python3 -I -c '
+import json, sys
+d = json.load(sys.stdin)["SPBluetoothDataType"][0]
+for sect, state in (("device_connected", "on"), ("device_not_connected", "off")):
+    for entry in d.get(sect, []):
+        for name, info in entry.items():
+            name = name.replace("|", " ").replace("\n", " ").replace("\r", " ")
+            print(state, info.get("device_minorType", "?"), info.get("device_address", "?"), name, sep="|")'
+}
+
+status() {
+  devices | while IFS='|' read -r state type addr name; do
+    printf '%-4s %-11s %-18s %s\n' "$state" "$type" "$addr" "$name"
+  done
+}
+
+snapshot() { log "devices: $(devices | tr '\n' ';')"; }
+
+notify() {
+  /usr/bin/osascript -e 'on run argv' -e 'display notification (item 1 of argv) with title "bt-fix"' -e 'end run' "$1" >/dev/null 2>&1
+}
+
+# Like devices(), but only KNOWN addresses pass through; anything else is reported.
+known_devices() {
+  local state type addr name
+  devices | while IFS='|' read -r state type addr name; do
+    if (( ${KNOWN[(Ie)$addr]} )); then
+      print -r -- "$state|$type|$addr|$name"
+    else
+      log "WARNING: unknown paired device '$name' ($addr, $type, $state) is not in KNOWN; ignoring it"
+      notify "Unknown paired Bluetooth device: $name ($addr)"
+    fi
+  done
+}
+
+cycle() {
+  log "power-cycling Bluetooth"
+  "$BLUEUTIL" -p 0; sleep 3; "$BLUEUTIL" -p 1
+  sleep "$SETTLE"
+  snapshot
+}
+
+# Exit 0 when a power cycle is warranted.
+needs_cycle() {
+  local devs type
+  if [[ "$("$BLUEUTIL" -p)" != 1 ]]; then log "bluetooth is off, leaving it alone"; return 1; fi
+  devs=$(known_devices)
+  if print -r -- "$devs" | grep -q '^on|Headphones|'; then log "headphones in use, not cycling"; return 1; fi
+  for type in Mouse Keyboard; do
+    if print -r -- "$devs" | grep -q "^off|$type|" && ! print -r -- "$devs" | grep -q "^on|$type|"; then
+      log "paired $type present but none connected"; return 0
+    fi
+  done
+  log "input devices fine, nothing to do"; return 1
+}
+
+check() { snapshot; needs_cycle && cycle; }
+
+watch() {
+  log "watch started (pid $$)"
+  local last_power last_tick power now
+  last_power=$("$BLUEUTIL" -p); last_tick=$(date +%s)
+  sleep "$SETTLE"; check
+  while true; do
+    sleep "$POLL"
+    now=$(date +%s); power=$("$BLUEUTIL" -p)
+    if (( now - last_tick > POLL + 60 )); then
+      log "wake detected after $((now - last_tick))s"; sleep "$SETTLE"; check
+    elif [[ "$last_power" == 0 && "$power" == 1 ]]; then
+      log "bluetooth powered on"; sleep "$SETTLE"; check
+    fi
+    last_tick=$(date +%s); last_power=$("$BLUEUTIL" -p)
+  done
+}
+
+# Write CONF from the current paired list, one address per line with the name as a comment.
+init() {
+  if [[ -e "$CONF" && "${2:-}" != --force ]]; then
+    print -u2 "bt-fix: $CONF exists; edit it or rerun with --force"; exit 73
+  fi
+  mkdir -p "${CONF:h}"
+  {
+    print -r -- "# bt-fix known devices, written $(date '+%F %T') on $(scutil --get ComputerName 2>/dev/null)"
+    print -r -- "# one Bluetooth address per line; delete lines for devices bt-fix should ignore"
+    devices | while IFS='|' read -r state type addr name; do
+      printf '%s   # %s (%s)\n' "$addr" "$name" "$type"
+    done
+  } > "$CONF"
+  cat "$CONF"
+}
+
+# Write and (re)load the launchd agent that runs `bt-fix watch` for this user.
+install() {
+  local plist=$HOME/Library/LaunchAgents/local.bt-fix.plist
+  mkdir -p "${plist:h}" "${LOG:h}"
+  cat > "$plist" <<EOT
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>local.bt-fix</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$SELF</string>
+    <string>watch</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>$LOG</string>
+  <key>StandardErrorPath</key>
+  <string>$LOG</string>
+</dict>
+</plist>
+EOT
+  launchctl bootout "gui/$(id -u)/local.bt-fix" 2>/dev/null
+  launchctl bootstrap "gui/$(id -u)" "$plist" && print "bt-fix: watcher installed from $plist"
+}
+
+case "${1:-status}" in
+  status|cycle|check|watch|install) "$1" ;;
+  init) init "$@" ;;
+  *) sed -n '2,13p' "$0"; exit 64 ;;
+esac
